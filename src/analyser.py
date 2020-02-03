@@ -25,15 +25,9 @@ def Str2Int(s):
         return int(s, 10)
 
 
-"""
-读取ini配置文件
-"""
-DEFAULT_VALUE   = 0
-START_OFFSET    = 1
-END_OFFSET      = 2
-
 def ParseConfigValue(cfg_value):
     """
+    解析配置文件中字段的描述信息
     cfg_value可能的格式如下
          1
          1          =   1
@@ -61,9 +55,16 @@ def ParseConfigValue(cfg_value):
     else:
         end_offset = start_offset
 
+    # start_offset必须要不大于end_offset
+    if start_offset > end_offset:
+        start_offset, end_offset = end_offset, start_offset
+
     return (default_value, start_offset, end_offset)
 
 
+"""
+读取ini配置文件
+"""
 def ReadTemplate(file):
     templates = {}
 
@@ -135,7 +136,7 @@ class BitView(QtWidgets.QToolButton):
 """
 class Reg32View(QtWidgets.QGroupBox):
 
-    reg32ValueChanged = QtCore.pyqtSignal(int, str)
+    reg32ValueChanged = QtCore.pyqtSignal(int, int)
 
     def __init__(self, parent=None, dword=0):
         super().__init__(parent)
@@ -203,7 +204,7 @@ class Reg32View(QtWidgets.QGroupBox):
             self.setTitle(f'DWORD {self.dword} inspection')
 
     def sendReg32ValueChanged(self):
-        self.reg32ValueChanged.emit(self.dword, self.getReg32HexStr())
+        self.reg32ValueChanged.emit(self.dword, self.getReg32Value())
 
     def onReg32BitChanged(self, bit_index, bit_value):
         self.reg32bits[31 - bit_index] = bool(bit_value)  # 设置对应bit值
@@ -249,12 +250,109 @@ class InputEdit(QtWidgets.QLineEdit):
 
     def __init__(self, s, parent=None):
         super().__init__(s, parent)
+        self.setCursor(QtGui.QCursor(QtCore.Qt.ArrowCursor))
+        validator = QtGui.QRegExpValidator(QtCore.QRegExp("[0-9A-Fa-f]*"))
+        self.setValidator(validator)
+        font = QtGui.QFont()
+        font.setFamily('Consolas')
+        font.setPointSize(11)
+        self.setFont(font)
+
+        # self.setReadOnly(True)
 
     def mousePressEvent(self, event):
         QtWidgets.QLineEdit.mousePressEvent(self, event)
         pos = self.cursorPosition()
+        if pos == len(self.text()):
+            pos -= 1
         self.setSelection((pos >> 3) << 3, 8)
         self.clicked.emit((pos >> 3), self.selectedText())
+
+    def updateHexStr(self, dword, value):
+        value = value & 0xFFFFFFFF
+        lvalue = list(f'{value:08X}')
+        ltext = list(self.text())
+        pos = dword << 3
+        for i in range(0, 8):
+            ltext[pos + i] = lvalue[i]
+        self.setText(''.join(ltext))
+        self.setSelection(pos, 8)
+
+    def setDwordSelection(self, dword):
+        self.setSelection(dword << 3, 8)
+        self.clicked.emit(dword, self.selectedText())
+
+
+###################################################################################################
+
+"""
+字段解析显示
+"""
+class FieldsView(QtWidgets.QTreeView):
+    FIELD = 0
+    START_OFFSET = 1
+    END_OFFSET = 2
+    VALUE = 3
+
+    selectDword = QtCore.pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.bitarray = bitarray()
+
+        self.model = QtGui.QStandardItemModel(0, 4)
+        self.model.setHeaderData(self.FIELD, QtCore.Qt.Horizontal, "Field")
+        self.model.setHeaderData(self.START_OFFSET, QtCore.Qt.Horizontal, "From Bit#")
+        self.model.setHeaderData(self.END_OFFSET, QtCore.Qt.Horizontal, "To Bit#")
+        self.model.setHeaderData(self.VALUE, QtCore.Qt.Horizontal, "Value")
+        self.setModel(self.model)
+        
+        self.model.itemChanged.connect(self.onFieldValueChanged)
+        self.clicked.connect(self.onFieldClicked)
+
+    def parse(self, hexstr, template):
+        # 解析过程中断开信号处理
+        self.model.itemChanged.disconnect(self.onFieldValueChanged)
+
+        # 先清除当前model中的所有数据(不使用clear()方法，因为clear会同时清除header)
+        self.model.removeRows(0, self.model.rowCount())
+        self.model.setRowCount(len(template))
+        
+        binstr = bin(int(hexstr, 16))[2:]
+        binstr = binstr.zfill(len(hexstr)<<2)
+        self.bitarray = bitarray(binstr)
+        
+        row = 0
+        for field, info in template.items():
+            value, start_offset, end_offset = info
+            if start_offset == end_offset:
+                value = str(int(self.bitarray[start_offset]))
+                # value = self.bitarray[start_offset]
+            else:
+                value = '0x'+self.bitarray[start_offset:end_offset].tobytes().hex().upper()
+                # value = int(self.bitarray[start_offset:end_offset].tobytes().hex(), 16)
+            self.model.setData(self.model.index(row, self.VALUE), value, QtCore.Qt.DisplayRole)
+
+            for col, val in zip([self.FIELD, self.START_OFFSET, self.END_OFFSET], [field, start_offset, end_offset]):
+                item = QtGui.QStandardItem()
+                item.setEditable(False)
+                item.setData(val, QtCore.Qt.DisplayRole)
+                self.model.setItem(row, col, item)
+
+            row += 1
+
+        # 恢复信号处理
+        self.model.itemChanged.connect(self.onFieldValueChanged)
+
+    def onFieldValueChanged(self, item):
+        index = self.model.indexFromItem(item)
+        print(index.row(), index.column(), item.data(QtCore.Qt.DisplayRole))
+
+    def onFieldClicked(self, index):
+        data = self.model.itemData(self.model.index(index.row(), self.START_OFFSET))
+        dword = data[0] >> 5    # 1个长字（4字节）有32bits
+        self.selectDword.emit(dword)
 
 
 ###################################################################################################
@@ -268,14 +366,16 @@ class AnalyserUi(QtWidgets.QMainWindow):
 
         self.templates = ReadTemplate(TEMPLATE_FILE)
 
-        self.hexstr = '0000000011000000'
+        self.hexstr = 'ABCDEF0123456789ABCDEF0123456789'
         self.bytesize = len(self.hexstr) >> 1
         self.dwordsize = self.bytesize >> 2
 
         self.initUi()
 
-        self.reg32view.reg32ValueChanged.connect(self.onReg32ValueChanged)
+        self.reg32view.reg32ValueChanged.connect(self.inputview.updateHexStr)
         self.inputview.clicked.connect(self.reg32view.update)
+        self.fieldsview.parse(self.inputview.text(), self.templates['IPCT_RESULT'])
+        self.fieldsview.selectDword.connect(self.inputview.setDwordSelection)
 
         self.show()
 
@@ -303,12 +403,9 @@ class AnalyserUi(QtWidgets.QMainWindow):
         grid.setVerticalSpacing(16)
         centralwidget.setLayout(grid)
   
-        validator = QtGui.QRegExpValidator(QtCore.QRegExp("[0-9A-Fa-f]*"))
         self.inputview = InputEdit(self.hexstr)
         grid.addWidget(self.inputview, 0, 0, 1, 3)
-        self.inputview.setValidator(validator)
         self.inputview.setSelection(0, 8)
-        self.inputview.setFont(font)
         
         self.reg32view = Reg32View(self)
         grid.addWidget(self.reg32view, 1, 0, 1, 3)
@@ -322,16 +419,12 @@ class AnalyserUi(QtWidgets.QMainWindow):
         self.selector.setFont(font)
         self.selector.addItems(list(self.templates))    # 模板添加到下拉列表中
 
-        self.treeview = QtWidgets.QTreeView()
-        grid.addWidget(self.treeview, 2, 2, 2, 1)
-        self.treemodel = QtGui.QStandardItemModel(0, 3)
-        self.treemodel.setHorizontalHeaderLabels(['Field', 'Offset', 'Value'])
-        self.treeview.setModel(self.treemodel)
+        self.fieldsview = FieldsView()
+        grid.addWidget(self.fieldsview, 2, 2, 2, 1)
+        # self.treemodel = QtGui.QStandardItemModel(0, 3)
+        # self.treemodel.setHorizontalHeaderLabels(['Field', 'Offset', 'Value'])
+        # self.treeview.setModel(self.treemodel)
 
-    def onReg32ValueChanged(self, dword, value):
-        self.inputview.setText(value)
-        self.inputview.setSelection(dword << 3, 8)
-    
 
 ###################################################################################################
 
